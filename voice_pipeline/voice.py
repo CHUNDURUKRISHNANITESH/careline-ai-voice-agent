@@ -1,7 +1,7 @@
 import os,json,re
 import aiohttp
 from datetime import date
-from pipecat.frames.frames import AudioRawFrame, InputAudioRawFrame, OutputAudioRawFrame, TranscriptionFrame, TextFrame, LLMTextFrame, LLMRunFrame, InterruptionFrame
+from pipecat.frames.frames import AudioRawFrame, InputAudioRawFrame, OutputAudioRawFrame, TranscriptionFrame, TextFrame, LLMTextFrame, LLMContextFrame, LLMFullResponseStartFrame, LLMFullResponseEndFrame, FunctionCallsStartedFrame, LLMRunFrame, InterruptionFrame
 from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.transports.websocket.server import WebsocketServerTransport, WebsocketServerParams
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -14,7 +14,6 @@ from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.google.llm import GoogleLLMService
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
-from pipecat.turns.user_start.min_words_user_turn_start_strategy import MinWordsUserTurnStartStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
@@ -32,7 +31,11 @@ class PCMSerializer(FrameSerializer):
     @property
     def type(self): return FrameSerializer.FrameSerializerType.BINARY if hasattr(FrameSerializer,'FrameSerializerType') else 'binary'
 class Transcript(FrameProcessor):
-    def __init__(self,ws,role): super().__init__(); self.ws=ws; self.role=role
+    def __init__(self,ws,role,state=None): super().__init__(); self.ws=ws; self.role=role; self.state=state; self.tool_call=False
+    async def _set_thinking(self,active):
+        if self.state is not None and self.state.get('thinking')!=active:
+            self.state['thinking']=active
+            await self.ws.send_json({'type':'thinking','active':active})
     async def process_frame(self,frame,direction):
         await super().process_frame(frame,direction)
         if self.role=='caller' and isinstance(frame,TranscriptionFrame):
@@ -41,15 +44,26 @@ class Transcript(FrameProcessor):
                 return
             frame.text=cleaned
             await self.ws.send_json({'type':'transcript','role':self.role,'text':cleaned})
-        elif self.role=='assistant' and isinstance(frame,LLMTextFrame):
-            await self.ws.send_json({'type':'transcript','role':self.role,'text':frame.text})
+        elif self.role=='thinking' and isinstance(frame,LLMContextFrame):
+            await self._set_thinking(True)
+        elif self.role=='assistant':
+            if isinstance(frame,LLMFullResponseStartFrame):
+                self.tool_call=False
+            elif isinstance(frame,FunctionCallsStartedFrame):
+                self.tool_call=True
+            elif isinstance(frame,LLMTextFrame):
+                if frame.text:
+                    await self._set_thinking(False)
+                await self.ws.send_json({'type':'transcript','role':self.role,'text':frame.text})
+            elif isinstance(frame,InterruptionFrame) or (isinstance(frame,LLMFullResponseEndFrame) and not self.tool_call):
+                await self._set_thinking(False)
         await self.push_frame(frame,direction)
 async def run_voice(ws):
     async with aiohttp.ClientSession() as session:
         await run_voice_pipeline(ws, session)
 
 async def run_voice_pipeline(ws, session):
-    vad=SileroVADAnalyzer(params=VADParams(confidence=0.55,start_secs=0.2,stop_secs=1.3,min_volume=0.3))
+    vad=SileroVADAnalyzer(params=VADParams(confidence=0.68,start_secs=0.2,stop_secs=1.0,min_volume=0.4))
     transport=WebsocketServerTransport(host="127.0.0.1",port=8765,params=WebsocketServerParams(audio_in_enabled=True,audio_out_enabled=True,add_wav_header=False,serializer=PCMSerializer(),vad_analyzer=vad))
     stt = ElevenLabsSTTService(
         api_key=os.environ['ELEVENLABS_API_KEY'],
@@ -72,14 +86,20 @@ async def run_voice_pipeline(ws, session):
         if not args.pop('confirmed',False): await p.result_callback({'error':'Confirm spoken phone first'}); return
         try: result=fn(**args)
         except (ValueError,TypeError) as e: result={'error':str(e)}
-        await ws.send_json(store.dashboard())
+        snap=store.dashboard()
+        await ws.send_json(snap)
+        if fn is store.book and isinstance(result,dict) and 'error' not in result:
+            appt=next((a for a in snap['appointments'] if a['id']==result['appointment_id']),None)
+            if appt:
+                await ws.send_json({'type':'booked','appointment':appt})
         await p.result_callback(result)
     async def book(p): await mutate(p,store.book)
     async def cancel(p): await mutate(p,store.cancel)
     for name,fn in [('check_doctor_availability',check),('book_appointment',book),('cancel_appointment',cancel)]: llm.register_function(name,fn)
     context=LLMContext([{'role':'system','content':f'You are Careline, a friendly appointment receptionist. Today is {date.today()} in India. Greet briefly once at the start of the call. Only schedule appointments; no medical advice. Ask the caller to speak their 10 digit phone number, convert spoken digits into 10 digits, read each digit back, and wait for explicit confirmation before booking or cancelling. Never guess phone numbers, dates or slot IDs. Use tools for every availability check and mutation. Ask which appointment if multiple. Never claim success unless tool succeeded. Offer a few slots, speak concise natural English. Confirm selected slot before booking and intended cancellation before cancelling.'}],tools=tools)
-    agg=LLMContextAggregatorPair(context,user_params=LLMUserAggregatorParams(user_turn_strategies=UserTurnStrategies(start=[MinWordsUserTurnStartStrategy(min_words=2,use_interim=False)])))
-    task=PipelineTask(Pipeline([transport.input(),stt,Transcript(ws,'caller'),agg.user(),llm,Transcript(ws,'assistant'),tts,transport.output(),agg.assistant()]),params=PipelineParams(audio_in_sample_rate=16000,audio_out_sample_rate=24000,allow_interruptions=True))
+    agg=LLMContextAggregatorPair(context,user_params=LLMUserAggregatorParams(user_turn_strategies=UserTurnStrategies(),user_turn_stop_timeout=2.5))
+    ui_state={'thinking':False}
+    task=PipelineTask(Pipeline([transport.input(),stt,Transcript(ws,'caller'),agg.user(),Transcript(ws,'thinking',ui_state),llm,Transcript(ws,'assistant',ui_state),tts,transport.output(),agg.assistant()]),params=PipelineParams(audio_in_sample_rate=16000,audio_out_sample_rate=24000,allow_interruptions=True))
     @task.event_handler('on_pipeline_error')
     async def on_error(task, error):
         await ws.send_json({'type':'error','text':getattr(error,'error',str(error))})

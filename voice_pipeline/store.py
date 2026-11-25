@@ -35,6 +35,4 @@ def cancel(phone,appointment_id=0):
     if len(rows)!=1: return {'error':'Multiple bookings; ask which appointment' if rows else 'No matching booking','appointments':appointments(phone)}
     rows[0]['status']='cancelled'; return {'status':'cancelled','appointment_id':rows[0]['id']}
 def dashboard():
-    rows=appointments()
-    for a in rows: a['phone']='••••••'+a['phone'][-4:]
-    return {'type':'dashboard','slots':availability(),'appointments':rows}
+    return {'type':'dashboard','slots':availability(),'appointments':appointments()}
