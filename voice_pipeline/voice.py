@@ -1,4 +1,4 @@
-import os,json,re
+import os,json,re,asyncio
 import aiohttp
 from datetime import date
 from pipecat.frames.frames import AudioRawFrame, InputAudioRawFrame, OutputAudioRawFrame, TranscriptionFrame, TextFrame, LLMTextFrame, LLMContextFrame, LLMFullResponseStartFrame, LLMFullResponseEndFrame, FunctionCallsStartedFrame, LLMRunFrame, InterruptionFrame
@@ -58,6 +58,36 @@ class Transcript(FrameProcessor):
             elif isinstance(frame,InterruptionFrame) or (isinstance(frame,LLMFullResponseEndFrame) and not self.tool_call):
                 await self._set_thinking(False)
         await self.push_frame(frame,direction)
+class ResilientGoogleLLMService(GoogleLLMService):
+    async def _process_context(self, context):
+        primary=self._model_name
+        fallbacks=[m for m in (primary,'gemini-flash-lite-latest','gemini-3-flash-preview','gemini-3.6-flash') if m]
+        tried=[]
+        for model in fallbacks:
+            if model in tried: continue
+            tried.append(model)
+            self._model_name=model
+            last_err=None
+            async def _capture_error(error_msg,exception=None,fatal=False):
+                nonlocal last_err
+                last_err=(error_msg,exception,fatal)
+            orig_push_error=self.push_error
+            self.push_error=_capture_error
+            try:
+                await super()._process_context(context)
+            finally:
+                self.push_error=orig_push_error
+            if last_err is None:
+                self._model_name=primary
+                return
+            msg,exc,fatal=last_err
+            if any(k in msg for k in ('503','429','UNAVAILABLE','RESOURCE_EXHAUSTED')) and len(tried)<len(fallbacks):
+                await asyncio.sleep(0.3)
+                continue
+            self._model_name=primary
+            await orig_push_error(error_msg=msg,exception=exc,fatal=fatal)
+            return
+        self._model_name=primary
 async def run_voice(ws):
     async with aiohttp.ClientSession() as session:
         await run_voice_pipeline(ws, session)
@@ -70,7 +100,7 @@ async def run_voice_pipeline(ws, session):
         aiohttp_session=session
     )
     tts=ElevenLabsTTSService(api_key=os.environ['ELEVENLABS_API_KEY'],voice_id=os.getenv('ELEVENLABS_VOICE_ID','EXAVITQu4vr4xnSDxMaL'))
-    llm=GoogleLLMService(
+    llm=ResilientGoogleLLMService(
         api_key=os.environ['GOOGLE_API_KEY'],
         model=os.getenv('GEMINI_MODEL','gemini-3.5-flash-lite'),
         params=GoogleLLMService.InputParams(thinking=GoogleLLMService.ThinkingConfig(thinking_level='minimal')),
@@ -96,7 +126,7 @@ async def run_voice_pipeline(ws, session):
     async def book(p): await mutate(p,store.book)
     async def cancel(p): await mutate(p,store.cancel)
     for name,fn in [('check_doctor_availability',check),('book_appointment',book),('cancel_appointment',cancel)]: llm.register_function(name,fn)
-    context=LLMContext([{'role':'system','content':f'You are Careline, a friendly appointment receptionist. Today is {date.today()} in India. Greet briefly once at the start of the call. Only schedule appointments; no medical advice. Ask the caller to speak their 10 digit phone number, convert spoken digits into 10 digits, read each digit back, and wait for explicit confirmation before booking or cancelling. Never guess phone numbers, dates or slot IDs. Use tools for every availability check and mutation. Ask which appointment if multiple. Never claim success unless tool succeeded. Offer a few slots, speak concise natural English. Confirm selected slot before booking and intended cancellation before cancelling.'}],tools=tools)
+    context=LLMContext([{'role':'system','content':f'You are Careline, a friendly appointment receptionist. Today is {date.today()} in India. Greet briefly once at the start of the call. Only schedule appointments; no medical advice. You can book or cancel multiple appointments in one call. Ask the caller to speak their 10 digit phone number, convert spoken digits into 10 digits, read each digit back, and wait for explicit confirmation before booking or cancelling. Never guess phone numbers, dates or slot IDs. Use tools for every availability check and mutation. Ask which appointment if multiple. Never claim success unless tool succeeded. Offer a few slots, speak concise natural English. Confirm selected slot before booking and intended cancellation before cancelling.'}],tools=tools)
     agg=LLMContextAggregatorPair(context,user_params=LLMUserAggregatorParams(user_turn_strategies=UserTurnStrategies(),user_turn_stop_timeout=2.5))
     ui_state={'thinking':False}
     task=PipelineTask(Pipeline([transport.input(),stt,Transcript(ws,'caller'),agg.user(),Transcript(ws,'thinking',ui_state),llm,Transcript(ws,'assistant',ui_state),tts,transport.output(),agg.assistant()]),params=PipelineParams(audio_in_sample_rate=16000,audio_out_sample_rate=24000,allow_interruptions=True))
